@@ -14,6 +14,15 @@ const ICONS = {
 const MAX_ATTACHMENT_BYTES = 1.5 * 1024 * 1024;
 const MAX_ATTACHMENT_COUNT = 5;
 const ATTACHMENT_TYPES = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".pdf": "application/pdf" };
+const STORAGE_KEYS = {
+  accounts: "ekelurahan.demo.accounts.v1",
+  requests: "ekelurahan.demo.requests.v1",
+  session: "ekelurahan.demo.session.v1"
+};
+const DEMO_STAFF = [
+  { email: "operator@demo.local", password: "Operator-Demo-2026!", role: "Operator Kelurahan", name: "Operator Kelurahan", initials: "OK", nik: null },
+  { email: "lurah@demo.local", password: "Lurah-Demo-2026!", role: "Lurah / Seklur", name: "Lurah / Seklur", initials: "LS", nik: null }
+];
 const SERVICES = [
   { name: "Surat Keterangan Tidak Mampu", short: "SKTM", icon: ICONS.users },
   { name: "Surat Keterangan Usaha", short: "SKU", icon: ICONS.file },
@@ -32,21 +41,149 @@ const ROLE_PAGES = {
   "Warga / Pemohon": ["dashboard", "permohonan", "surat"]
 };
 
-async function apiFetch(url, options = {}) {
-  const response = await fetch(url, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) }
-  });
-  let payload;
-  try { payload = await response.json(); }
-  catch (error) { throw new Error("Respons server tidak valid."); }
-  if (!response.ok) throw new Error(payload.error || "Permintaan gagal diproses.");
-  return payload;
+function readStoredValue(key, fallback) {
+  const stored = localStorage.getItem(key);
+  if (stored === null) return fallback;
+  try {
+    return JSON.parse(stored);
+  } catch (error) {
+    throw new Error("Data uji coba di browser rusak. Hapus data situs lalu muat ulang.");
+  }
 }
-async function loadRequests() {
-  const payload = await apiFetch("/api/requests");
-  requests = payload.requests;
+
+function writeStoredValue(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (error) {
+    if (error?.name === "QuotaExceededError") {
+      throw new Error("Penyimpanan browser penuh. Hapus data uji coba atau gunakan lampiran yang lebih kecil.");
+    }
+    throw new Error("Data uji coba tidak dapat disimpan di browser ini.");
+  }
+}
+
+function readAccounts() {
+  let accounts = readStoredValue(STORAGE_KEYS.accounts, null);
+  if (!Array.isArray(accounts)) accounts = DEMO_STAFF.map(account => ({ ...account }));
+  const existingEmails = new Set(accounts.map(account => account.email));
+  const missingDemoAccounts = DEMO_STAFF.filter(account => !existingEmails.has(account.email));
+  if (missingDemoAccounts.length) {
+    accounts = [...accounts, ...missingDemoAccounts.map(account => ({ ...account }))];
+    writeStoredValue(STORAGE_KEYS.accounts, accounts);
+  } else if (localStorage.getItem(STORAGE_KEYS.accounts) === null) {
+    writeStoredValue(STORAGE_KEYS.accounts, accounts);
+  }
+  return accounts;
+}
+
+function readRequests() {
+  const stored = readStoredValue(STORAGE_KEYS.requests, []);
+  if (!Array.isArray(stored)) throw new Error("Data permohonan uji coba tidak valid.");
+  return stored;
+}
+
+function currentLocalUser() {
+  const email = localStorage.getItem(STORAGE_KEYS.session);
+  const account = email && readAccounts().find(item => item.email === email);
+  if (!account) return null;
+  const { password, ...user } = account;
+  return user;
+}
+
+function loginLocal(email, password) {
+  const account = readAccounts().find(item => item.email === email && item.password === password);
+  if (!account) throw new Error("Email atau kata sandi tidak sesuai.");
+  localStorage.setItem(STORAGE_KEYS.session, account.email);
+  const { password: storedPassword, ...user } = account;
+  return user;
+}
+
+function registerLocal({ name, email, nik, password }) {
+  name = String(name || "").trim();
+  email = String(email || "").trim().toLowerCase();
+  nik = String(nik || "").trim();
+  if (name.length < 3 || name.length > 100) throw new Error("Nama harus terdiri dari 3 sampai 100 karakter.");
+  if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("Format email tidak valid.");
+  if (!/^\d{16}$/.test(nik)) throw new Error("NIK harus terdiri dari 16 angka.");
+  if (typeof password !== "string" || password.length < 12 || password.length > 128) {
+    throw new Error("Kata sandi harus terdiri dari 12 sampai 128 karakter.");
+  }
+  const accounts = readAccounts();
+  if (accounts.some(account => account.email === email)) throw new Error("Email sudah terdaftar. Silakan masuk.");
+  if (accounts.some(account => account.nik === nik)) throw new Error("NIK sudah terdaftar pada akun lain.");
+  const user = {
+    email,
+    password,
+    role: "Warga / Pemohon",
+    name,
+    initials: initials(name),
+    nik
+  };
+  writeStoredValue(STORAGE_KEYS.accounts, [...accounts, user]);
+  localStorage.setItem(STORAGE_KEYS.session, email);
+  const { password: storedPassword, ...publicUser } = user;
+  return publicUser;
+}
+
+function loadRequests() {
+  requests = readRequests();
   return requests;
+}
+
+function createLocalRequest(body) {
+  const user = currentLocalUser();
+  if (!user) throw new Error("Silakan masuk untuk membuat permohonan.");
+  if (user.role !== "Warga / Pemohon") throw new Error("Hanya warga yang dapat membuat permohonan.");
+  if (!/^\d{16}$/.test(body.nik || "")) throw new Error("NIK harus terdiri dari 16 angka.");
+  const attachments = Array.isArray(body.attachments) ? body.attachments : [];
+  if (attachments.length > MAX_ATTACHMENT_COUNT) throw new Error(`Pilih maksimal ${MAX_ATTACHMENT_COUNT} file persyaratan.`);
+  const totalBytes = attachments.reduce((total, file) => total + Number(file.size || 0), 0);
+  if (totalBytes > MAX_ATTACHMENT_BYTES) throw new Error("Total ukuran berkas maksimal 1,5 MB.");
+  const storedRequests = readRequests();
+  const lastSequence = storedRequests.reduce((highest, item) => {
+    const sequence = Number(String(item.id).match(/(\d+)$/)?.[1] || 0);
+    return Math.max(highest, sequence);
+  }, 428);
+  const now = new Date();
+  const item = {
+    id: `EKL-${now.getFullYear()}-${String(lastSequence + 1).padStart(5, "0")}`,
+    name: String(body.name || "").trim(),
+    nik: `${body.nik.slice(0, 6)}••••••${body.nik.slice(-4)}`,
+    phone: String(body.phone || "").trim(),
+    type: String(body.type || "").trim(),
+    date: new Intl.DateTimeFormat("id-ID", { day: "2-digit", month: "short", year: "numeric" }).format(now),
+    status: "Menunggu verifikasi",
+    rt: String(body.rt || "").trim(),
+    note: String(body.note || "").trim(),
+    attachments: attachments.map(file => ({ ...file, available: Boolean(file.dataUrl) })),
+    ownerEmail: user.email,
+    letterNo: null,
+    signedAt: null,
+    createdAt: now.toISOString()
+  };
+  writeStoredValue(STORAGE_KEYS.requests, [item, ...storedRequests]);
+  return item;
+}
+
+function updateLocalRequestStatus(id, status, note) {
+  const user = currentLocalUser();
+  const storedRequests = readRequests();
+  const item = storedRequests.find(request => request.id === id);
+  if (!user || !item) throw new Error("Data permohonan tidak ditemukan.");
+  const authorized = (status === "Menunggu tanda tangan" && user.role === "Operator Kelurahan" && item.status === "Menunggu verifikasi")
+    || (status === "Selesai" && user.role === "Lurah / Seklur" && item.status === "Menunggu tanda tangan")
+    || (status === "Ditolak" && ((user.role === "Operator Kelurahan" && item.status === "Menunggu verifikasi")
+      || (user.role === "Lurah / Seklur" && item.status === "Menunggu tanda tangan")));
+  if (!authorized) throw new Error("Aksi ini hanya dapat dilakukan petugas yang berwenang.");
+  item.status = status;
+  item.note = note !== undefined ? String(note) : item.note;
+  if (status === "Selesai") item.signedAt = new Date().toISOString();
+  writeStoredValue(STORAGE_KEYS.requests, storedRequests);
+  return item;
+}
+
+function logoutLocal() {
+  localStorage.removeItem(STORAGE_KEYS.session);
 }
 function escapeHTML(value) {
   return String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
@@ -73,14 +210,13 @@ function attachmentMarkup(file, requestId, index) {
   const name = escapeHTML(attachment.name || "Berkas tanpa nama");
   const type = attachment.type;
   const supported = Object.values(ATTACHMENT_TYPES).includes(type);
-  const fileUrl = attachment.available && supported
-    ? `/api/requests/${encodeURIComponent(requestId)}/attachments/${index}`
-    : "";
+  const hasDataUrl = typeof attachment.dataUrl === "string" && attachment.dataUrl.startsWith(`data:${type};base64,`);
+  const fileUrl = attachment.available && supported && hasDataUrl ? escapeHTML(attachment.dataUrl) : "";
   const thumbnail = fileUrl && type.startsWith("image/")
     ? `<img class="attachment-preview" src="${fileUrl}" alt="Pratinjau ${name}">`
     : `<div class="attachment-file-icon">${type === "application/pdf" ? "PDF" : "FILE"}</div>`;
   const actions = fileUrl
-    ? `<div class="attachment-actions"><a href="${fileUrl}" target="_blank" rel="noopener noreferrer">Buka berkas</a><a href="${fileUrl}?download=1">Unduh</a></div>`
+    ? `<div class="attachment-actions"><a href="${fileUrl}" target="_blank" rel="noopener noreferrer">Buka berkas</a><a href="${fileUrl}" download="${name}">Unduh</a></div>`
     : '<span class="attachment-meta">Pratinjau tidak tersedia</span>';
   const size = Number(attachment.size) > 0 ? `${Math.ceil(attachment.size / 1024)} KB` : "Lampiran";
   return `<div class="attachment-card">${thumbnail}<div><span class="attachment-name">${name}</span><span class="attachment-meta">${size}</span>${actions}</div></div>`;
@@ -171,7 +307,7 @@ function citizenDashboardPage() {
   return `<div class="page-content">
         <div class="page-heading"><div><div class="eyebrow">Portal warga</div><h1>Halo, ${escapeHTML(currentUser?.name || "Warga")} 👋</h1><p class="subtitle">Pantau permohonan milik Anda. Verifikasi berkas dilakukan oleh operator kelurahan.</p></div><div class="heading-actions"><button class="button button-primary" data-action="new-request">${ICONS.plus} Ajukan surat</button></div></div>
         <div class="stats-grid">${statCard("Permohonan saya", mine.length, "pengajuan tercatat", ICONS.file, "green", "Total")}${statCard("Sedang diproses", waiting, "oleh petugas kelurahan", ICONS.clock, "orange", "Proses")}${statCard("Surat selesai", done, "siap dilihat", ICONS.check, "green", "Selesai")}</div>
-        <section class="panel table-panel"><div class="panel-head"><div><h2 class="panel-title">Permohonan saya</h2><p class="panel-subtitle">Status dapat dipantau; verifikasi dan persetujuan dilakukan petugas berwenang.</p></div></div>${tableMarkup(mine)}<div class="table-footer"><span>${mine.length} permohonan milik akun ini</span><span>Data tersimpan di server</span></div></section>
+        <section class="panel table-panel"><div class="panel-head"><div><h2 class="panel-title">Permohonan saya</h2><p class="panel-subtitle">Status dapat dipantau; verifikasi dan persetujuan dilakukan petugas berwenang.</p></div></div>${tableMarkup(mine)}<div class="table-footer"><span>${mine.length} permohonan milik akun ini</span><span>Data tersimpan di browser ini</span></div></section>
         <p class="data-note">Akun pemohon hanya dapat melihat pengajuan yang terhubung ke akunnya dan membuat permohonan baru.</p>
       </div>`;
 }
@@ -182,7 +318,7 @@ function dashboardPage() {
   return `<div class="page-content">
         <div class="page-heading"><div><div class="eyebrow">Ringkasan pelayanan</div><h1>Selamat datang, ${escapeHTML(currentUser?.name || "Petugas")} 👋</h1><p class="subtitle">Pantau permohonan administrasi Kelurahan Cihideung.</p></div><div class="heading-actions"><button class="button button-secondary" id="export-button">${ICONS.download} Ekspor laporan</button><button class="button button-primary" data-action="new-request">${ICONS.plus} Buat permohonan</button></div></div>
         <div class="stats-grid">
-          ${statCard("Total permohonan", requests.length, "tersimpan di sistem", ICONS.file, "green", "Total")}
+          ${statCard("Total permohonan", requests.length, "tersimpan di browser ini", ICONS.file, "green", "Total")}
           ${statCard("Menunggu verifikasi", waiting, "perlu ditindaklanjuti", ICONS.clock, "orange", "Dalam antrean")}
           ${statCard("Menunggu tanda tangan", signed, "siap diperiksa Lurah", ICONS.shield, "blue", "Perlu pengesahan")}
           ${statCard("Surat selesai", done, "selesai diproses", ICONS.check, "green", "Selesai")}
@@ -198,10 +334,10 @@ function dashboardPage() {
         <section class="panel table-panel"><div class="panel-head"><div><h2 class="panel-title">Permohonan terbaru</h2><p class="panel-subtitle">Pantau dan tindak lanjuti pengajuan warga</p></div><button class="row-action" data-page="permohonan">Lihat semua &nbsp; →</button></div>
           <div class="toolbar-line"><div class="table-tools"><div class="search-box">${ICONS.search}<input id="request-search" type="search" placeholder="Cari nama atau nomor tiket..." aria-label="Cari permohonan"></div><select class="filter-select" id="status-filter" aria-label="Filter status"><option>Semua status</option><option>Menunggu verifikasi</option><option>Menunggu tanda tangan</option><option>Selesai</option><option>Ditolak</option></select></div></div>
           ${tableMarkup(filteredRequests().slice(0, 5))}
-          <div class="table-footer"><span id="table-count">Menampilkan ${Math.min(requests.length, 5)} permohonan</span><span>Data tersimpan di server</span></div>
+          <div class="table-footer"><span id="table-count">Menampilkan ${Math.min(requests.length, 5)} permohonan</span><span>Data tersimpan di browser ini</span></div>
         </section>
         <div class="two-column"><section class="panel quick-card" data-action="new-request"><div class="service-icon">${ICONS.plus}</div><div><strong>Ajukan surat baru</strong><span>Mulai permohonan administrasi kependudukan</span></div><span class="quick-arrow">→</span></section><section class="panel quick-card" data-page="surat"><div class="service-icon">${ICONS.file}</div><div><strong>Arsip surat digital</strong><span>Akses dokumen terbit dan nomor surat</span></div><span class="quick-arrow">→</span></section></div>
-        <p class="data-note">Data permohonan tersimpan pada server. Verifikasi NIK Dukcapil, tanda tangan elektronik BSrE, dan notifikasi eksternal memerlukan integrasi resmi.</p>
+        <p class="data-note">Data uji coba tersimpan di browser ini saja. Verifikasi NIK Dukcapil, tanda tangan elektronik BSrE, dan notifikasi eksternal memerlukan integrasi resmi.</p>
       </div>`;
 }
 function requestsPage() {
@@ -215,7 +351,7 @@ function requestsPage() {
         </div>
         <section class="panel table-panel"><div class="panel-head"><div><h2 class="panel-title">Daftar permohonan</h2><p class="panel-subtitle">Klik detail untuk memeriksa berkas dan memperbarui status.</p></div></div>
           <div class="toolbar-line"><div class="table-tools"><div class="search-box">${ICONS.search}<input id="request-search" type="search" placeholder="Cari nama, tiket, layanan..." aria-label="Cari permohonan"></div><select class="filter-select" id="status-filter" aria-label="Filter status"><option>Semua status</option><option>Menunggu verifikasi</option><option>Menunggu tanda tangan</option><option>Selesai</option><option>Ditolak</option></select></div><button class="button button-secondary" id="export-button">${ICONS.download} Ekspor CSV</button></div>
-          ${tableMarkup(filteredRequests())}<div class="table-footer"><span id="table-count">Menampilkan ${requests.length} permohonan</span><span>Data tersimpan di server</span></div></section>
+          ${tableMarkup(filteredRequests())}<div class="table-footer"><span id="table-count">Menampilkan ${requests.length} permohonan</span><span>Data tersimpan di browser ini</span></div></section>
       </div>`;
 }
 function citizenPage() {
@@ -340,8 +476,8 @@ function openRequestForm() {
         <div class="field"><label for="citizen-rt">RT / RW *</label><input id="citizen-rt" name="rt" required placeholder="Contoh: 03 / 05"></div>
         <div class="field full"><label for="service-type">Jenis layanan *</label><select id="service-type" name="type" required><option value="">Pilih jenis surat</option>${SERVICES.map(item => `<option>${escapeHTML(item.name)}</option>`).join("")}</select></div>
         <div class="field full"><label for="request-note">Keperluan / keterangan</label><textarea id="request-note" name="note" maxlength="500" placeholder="Jelaskan keperluan pengajuan surat"></textarea></div>
-        <div class="field full"><label for="request-files">Berkas persyaratan</label><input class="file-input" id="request-files" name="files" type="file" accept=".jpg,.jpeg,.png,.pdf" multiple><span class="help-text">Format PDF, JPG, atau PNG; maksimal ${MAX_ATTACHMENT_COUNT} file dengan total 1,5 MB. Berkas disimpan di server untuk diperiksa petugas.</span></div>
-      </div><div class="notice warning">Permohonan disimpan pada server. Verifikasi identitas Dukcapil, WA Gateway, dan tanda tangan elektronik resmi belum terintegrasi.</div><div class="modal-actions"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button class="button button-primary" type="submit">${ICONS.check} Kirim permohonan</button></div></form>`;
+        <div class="field full"><label for="request-files">Berkas persyaratan</label><input class="file-input" id="request-files" name="files" type="file" accept=".jpg,.jpeg,.png,.pdf" multiple><span class="help-text">Format PDF, JPG, atau PNG; maksimal ${MAX_ATTACHMENT_COUNT} file dengan total 1,5 MB. Berkas hanya disimpan di browser ini untuk uji coba.</span></div>
+      </div><div class="notice warning">Data uji coba hanya tersimpan di browser ini dan tidak dikirim ke petugas. Verifikasi identitas Dukcapil, WA Gateway, dan tanda tangan elektronik resmi belum terintegrasi.</div><div class="modal-actions"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button class="button button-primary" type="submit">${ICONS.check} Kirim permohonan</button></div></form>`;
   showModal("Buat permohonan surat", "Lengkapi informasi pemohon dan persyaratan layanan.", body, async formData => {
     const rawNik = String(formData.get("nik") || "").trim();
     if (!/^\d{16}$/.test(rawNik)) { notify("NIK harus terdiri dari 16 angka.", "error"); return; }
@@ -364,23 +500,20 @@ function openRequestForm() {
       return;
     }
     try {
-      const payload = await apiFetch("/api/requests", {
-        method: "POST",
-        body: JSON.stringify({
-          name: String(formData.get("name") || "").trim(),
-          nik: rawNik,
-          phone: String(formData.get("phone") || "").trim(),
-          type: String(formData.get("type") || ""),
-          rt: String(formData.get("rt") || "").trim(),
-          note: String(formData.get("note") || "").trim(),
-          attachments
-        })
+      const request = createLocalRequest({
+        name: String(formData.get("name") || "").trim(),
+        nik: rawNik,
+        phone: String(formData.get("phone") || "").trim(),
+        type: String(formData.get("type") || ""),
+        rt: String(formData.get("rt") || "").trim(),
+        note: String(formData.get("note") || "").trim(),
+        attachments
       });
-      requests.unshift(payload.request);
+      requests.unshift(request);
       closeModal();
       currentPage = "permohonan";
       render();
-      notify(`Permohonan ${payload.request.id} berhasil dicatat.`);
+      notify(`Permohonan ${request.id} berhasil dicatat.`);
     } catch (error) {
       console.error("Permohonan gagal disimpan:", error);
       notify(error instanceof Error ? error.message : "Permohonan gagal disimpan.", "error");
@@ -425,11 +558,7 @@ async function updateStatus(id, status, note) {
     || (status === "Ditolak" && canReject(item));
   if (!authorized) { notify("Aksi ini hanya dapat dilakukan petugas yang berwenang.", "error"); return; }
   try {
-    const payload = await apiFetch(`/api/requests/${encodeURIComponent(id)}/status`, {
-      method: "PATCH",
-      body: JSON.stringify({ status, note })
-    });
-    Object.assign(item, payload.request);
+    Object.assign(item, updateLocalRequestStatus(id, status, note));
     closeModal();
     render();
     notify(`Status permohonan diperbarui: ${status}.`);
@@ -497,12 +626,8 @@ function setCurrentUser(user) {
   currentPage = "dashboard";
   return true;
 }
-async function leaveApplication() {
-  try {
-    await apiFetch("/api/auth/logout", { method: "POST", body: "{}" });
-  } catch (error) {
-    console.error("Sesi gagal dihapus:", error);
-  }
+function leaveApplication() {
+  logoutLocal();
   currentUser = null;
   role = "Operator Kelurahan";
   document.getElementById("profile-name").textContent = "Ilham Abdul Halim";
@@ -575,11 +700,8 @@ document.getElementById("login-form").addEventListener("submit", async event => 
   const email = String(formData.get("email") || "").trim().toLowerCase();
   const password = String(formData.get("password") || "");
   try {
-    const payload = await apiFetch("/api/auth/login", {
-      method: "POST",
-      body: JSON.stringify({ email, password })
-    });
-    setCurrentUser(payload.user);
+    const user = loginLocal(email, password);
+    setCurrentUser(user);
     await loadRequests();
     document.getElementById("login-error").hidden = true;
     enterApplication();
@@ -601,16 +723,13 @@ document.getElementById("register-form").addEventListener("submit", async event 
     return;
   }
   try {
-    const payload = await apiFetch("/api/auth/register", {
-      method: "POST",
-      body: JSON.stringify({
-        name: String(formData.get("name") || "").trim(),
-        email: String(formData.get("email") || "").trim().toLowerCase(),
-        nik: String(formData.get("nik") || "").trim(),
-        password
-      })
+    const user = registerLocal({
+      name: String(formData.get("name") || "").trim(),
+      email: String(formData.get("email") || "").trim().toLowerCase(),
+      nik: String(formData.get("nik") || "").trim(),
+      password
     });
-    setCurrentUser(payload.user);
+    setCurrentUser(user);
     await loadRequests();
     error.hidden = true;
     enterApplication();
@@ -627,14 +746,15 @@ document.getElementById("password-toggle").addEventListener("click", event => {
   event.currentTarget.setAttribute("aria-label", visible ? "Sembunyikan kata sandi" : "Tampilkan kata sandi");
 });
 document.getElementById("logout-button").addEventListener("click", leaveApplication);
-apiFetch("/api/me")
-  .then(async payload => {
-    if (!payload.user) {
-      document.getElementById("login-email").focus();
-      return;
-    }
-    setCurrentUser(payload.user);
-    await loadRequests();
+try {
+  const user = currentLocalUser();
+  if (user) {
+    setCurrentUser(user);
+    loadRequests();
     enterApplication();
-  })
-  .catch(() => document.getElementById("login-email").focus());
+  } else {
+    document.getElementById("login-email").focus();
+  }
+} catch (error) {
+  showLoginError(error instanceof Error ? error.message : "Data uji coba gagal dimuat.");
+}
