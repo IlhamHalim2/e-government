@@ -6,17 +6,16 @@ const path = require("path");
 const crypto = require("crypto");
 const { DatabaseSync } = require("node:sqlite");
 
-const HOST = process.env.HOST || "127.0.0.1";
+const HOST = process.env.HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || 3000);
 const ROOT = __dirname;
-const DATA_DIR = path.join(ROOT, "data");
-const DB_FILE = path.join(DATA_DIR, "ekelurahan.sqlite");
+const DB_FILE = path.resolve(process.env.DATABASE_PATH || path.join(ROOT, "data", "ekelurahan.sqlite"));
 const MAX_ATTACHMENT_BYTES = 1.5 * 1024 * 1024;
 const MAX_ATTACHMENT_COUNT = 5;
 const ATTACHMENT_TYPES = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".pdf": "application/pdf" };
 const sessions = new Map();
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
 const db = new DatabaseSync(DB_FILE);
 
 let legacyAccounts = [];
@@ -93,6 +92,9 @@ for (const account of legacyAccounts) {
 function seedStaffAccount({ email, role, name, initials, passwordEnv }) {
   if (db.prepare("SELECT email FROM accounts WHERE email = ?").get(email)) return;
   const configuredPassword = process.env[passwordEnv];
+  if (!configuredPassword && process.env.NODE_ENV === "production") {
+    throw new Error(`${passwordEnv} wajib diatur di lingkungan produksi.`);
+  }
   if (configuredPassword && configuredPassword.length < 12) {
     throw new Error(`${passwordEnv} harus memiliki minimal 12 karakter.`);
   }
@@ -101,7 +103,7 @@ function seedStaffAccount({ email, role, name, initials, passwordEnv }) {
     INSERT INTO accounts (email, password_hash, role, name, initials)
     VALUES (?, ?, ?, ?, ?)
   `).run(email, hashPassword(password), role, name, initials);
-  if (!process.env[passwordEnv]) {
+  if (!configuredPassword) {
     console.log(`Akun awal ${role}: ${email} / ${password}`);
     console.log("Simpan kata sandi ini. Kata sandi tidak disimpan dalam bentuk teks dan tidak ditampilkan lagi.");
   }
